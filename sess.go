@@ -122,7 +122,7 @@ type (
 )
 
 // newUDPSession create a new udp session for client or server
-func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, remote net.Addr, block BlockCrypt) *UDPSession {
+func newUDPSession(conv uint32, mtu, dataShards, parityShards int, l *Listener, conn net.PacketConn, remote net.Addr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
 	sess.die = make(chan struct{})
 	sess.nonce = new(nonceAES128)
@@ -170,6 +170,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 			sess.output(buf[:size])
 		}
 	})
+	sess.kcp.SetMtu(mtu)
 	sess.kcp.ReserveBytes(sess.headerSize)
 
 	// register current session to updater,
@@ -706,9 +707,10 @@ func (s *UDPSession) kcpInput(data []byte) {
 type (
 	// Listener defines a server which will be waiting to accept incoming connections
 	Listener struct {
-		block        BlockCrypt     // block encryption
-		dataShards   int            // FEC data shard
-		parityShards int            // FEC parity shard
+		block        BlockCrypt // block encryption
+		dataShards   int        // FEC data shard
+		parityShards int        // FEC parity shard
+		mtu          int
 		fecDecoder   *fecDecoder    // FEC mock initialization
 		conn         net.PacketConn // the underlying packet connection
 
@@ -783,7 +785,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 				defer l.sessionLock.Unlock()
 				if s, ok = l.sessions[*key]; !ok {
 					if len(l.chAccepts) < cap(l.chAccepts) { // do not let the new sessions overwhelm accept queue
-						s := newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, addr, l.block)
+						s := newUDPSession(conv, l.mtu, l.dataShards, l.parityShards, l, l.conn, addr, l.block)
 						s.kcpInput(data)
 						l.sessions[*key] = s
 						l.chAccepts <- s
@@ -915,7 +917,7 @@ func (l *Listener) closeSession(remote net.Addr, conv uint32) (ret bool) {
 func (l *Listener) Addr() net.Addr { return l.conn.LocalAddr() }
 
 // Listen listens for incoming KCP packets addressed to the local address laddr on the network "udp",
-func Listen(laddr string) (net.Listener, error) { return ListenWithOptions(laddr, nil, 0, 0) }
+func Listen(laddr string) (net.Listener, error) { return ListenWithOptions(laddr, nil, 1400, 0, 0) }
 
 // ListenWithOptions listens for incoming KCP packets addressed to the local address laddr on the network "udp" with packet encryption.
 //
@@ -924,7 +926,7 @@ func Listen(laddr string) (net.Listener, error) { return ListenWithOptions(laddr
 // 'dataShards', 'parityShards' specifiy how many parity packets will be generated following the data packets.
 //
 // Check https://github.com/klauspost/reedsolomon for details
-func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards int) (*Listener, error) {
+func ListenWithOptions(laddr string, block BlockCrypt, mtu, dataShards, parityShards int) (*Listener, error) {
 	udpaddr, err := net.ResolveUDPAddr("udp", laddr)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -934,17 +936,18 @@ func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards 
 		return nil, errors.WithStack(err)
 	}
 
-	return ServeConn(block, dataShards, parityShards, conn)
+	return ServeConn(block, mtu, dataShards, parityShards, conn)
 }
 
 // ServeConn serves KCP protocol for a single packet connection.
-func ServeConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*Listener, error) {
+func ServeConn(block BlockCrypt, mtu, dataShards, parityShards int, conn net.PacketConn) (*Listener, error) {
 	l := new(Listener)
 	l.conn = conn
 	l.sessions = make(map[connTrackKey]*UDPSession)
 	l.chAccepts = make(chan *UDPSession, acceptBacklog)
 	l.chSessionClosed = make(chan net.Addr)
 	l.die = make(chan struct{})
+	l.mtu = mtu
 	l.dataShards = dataShards
 	l.parityShards = parityShards
 	l.block = block
@@ -995,7 +998,7 @@ func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards in
 
 // NewConn3 establishes a session and talks KCP protocol over a packet connection.
 func NewConn3(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*UDPSession, error) {
-	return newUDPSession(convid, dataShards, parityShards, nil, conn, raddr, block), nil
+	return newUDPSession(convid, 1400, dataShards, parityShards, nil, conn, raddr, block), nil
 }
 
 // NewConn2 establishes a session and talks KCP protocol over a packet connection.
