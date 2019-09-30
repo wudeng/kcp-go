@@ -350,7 +350,7 @@ func (s *UDPSession) Close() error {
 		atomic.AddUint64(&DefaultSnmp.CurrEstab, ^uint64(0))
 
 		if s.l != nil { // belongs to listener
-			s.l.closeSession(s.remote)
+			s.l.closeSession(s.remote, s.GetConv())
 			return nil
 		} else { // client socket close
 			return s.conn.Close()
@@ -735,7 +735,7 @@ type (
 		fecDecoder   *fecDecoder    // FEC mock initialization
 		conn         net.PacketConn // the underlying packet connection
 
-		sessions        map[string]*UDPSession // all sessions accepted by this Listener
+		sessions        map[connTrackKey]*UDPSession // all sessions accepted by this Listener
 		sessionLock     sync.Mutex
 		chAccepts       chan *UDPSession // Listen() backlog
 		chSessionClosed chan net.Addr    // session close queue
@@ -752,6 +752,18 @@ type (
 		rd atomic.Value // read deadline for Accept()
 	}
 )
+
+type connTrackKey struct {
+	Addr string
+	Conv uint32
+}
+
+func newConnTrackKey(addr string, conv uint32) *connTrackKey {
+	return &connTrackKey{
+		Addr: addr,
+		Conv: conv,
+	}
+}
 
 // packet input stage
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
@@ -771,36 +783,37 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	}
 
 	if dataValid {
-		l.sessionLock.Lock()
-		s, ok := l.sessions[addr.String()]
-		l.sessionLock.Unlock()
-
-		if !ok { // new address:port
-			if len(l.chAccepts) < cap(l.chAccepts) { // do not let the new sessions overwhelm accept queue
-				var conv uint32
-				convValid := false
-				if l.fecDecoder != nil {
-					isfec := binary.LittleEndian.Uint16(data[4:])
-					if isfec == typeData {
-						conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
-						convValid = true
-					}
-				} else {
-					conv = binary.LittleEndian.Uint32(data)
-					convValid = true
-				}
-
-				if convValid { // creates a new session only if the 'conv' field in kcp is accessible
-					s := newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, addr, l.block)
-					s.kcpInput(data)
-					l.sessionLock.Lock()
-					l.sessions[addr.String()] = s
-					l.sessionLock.Unlock()
-					l.chAccepts <- s
-				}
+		var conv uint32
+		convValid := false
+		if l.fecDecoder != nil {
+			isfec := binary.LittleEndian.Uint16(data[4:])
+			if isfec == typeData {
+				conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
+				convValid = true
 			}
 		} else {
-			s.kcpInput(data)
+			conv = binary.LittleEndian.Uint32(data)
+			convValid = true
+		}
+
+		if convValid {
+			key := newConnTrackKey(addr.String(), conv)
+			l.sessionLock.Lock()
+			defer l.sessionLock.Unlock()
+			if s, ok := l.sessions[*key]; !ok { // new address:port
+				if s, ok = l.sessions[*key]; !ok {
+					if len(l.chAccepts) < cap(l.chAccepts) { // do not let the new sessions overwhelm accept queue
+						s := newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, addr, l.block)
+						s.kcpInput(data)
+						l.sessions[*key] = s
+						l.chAccepts <- s
+					}
+				} else {
+					s.kcpInput(data)
+				}
+			} else {
+				s.kcpInput(data)
+			}
 		}
 	}
 }
@@ -917,11 +930,12 @@ func (l *Listener) Close() error {
 }
 
 // closeSession notify the listener that a session has closed
-func (l *Listener) closeSession(remote net.Addr) (ret bool) {
+func (l *Listener) closeSession(remote net.Addr, conv uint32) (ret bool) {
 	l.sessionLock.Lock()
 	defer l.sessionLock.Unlock()
-	if _, ok := l.sessions[remote.String()]; ok {
-		delete(l.sessions, remote.String())
+	key := newConnTrackKey(remote.String(), conv)
+	if _, ok := l.sessions[*key]; ok {
+		delete(l.sessions, *key)
 		return true
 	}
 	return false
@@ -957,7 +971,7 @@ func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards 
 func ServeConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*Listener, error) {
 	l := new(Listener)
 	l.conn = conn
-	l.sessions = make(map[string]*UDPSession)
+	l.sessions = make(map[connTrackKey]*UDPSession)
 	l.chAccepts = make(chan *UDPSession, acceptBacklog)
 	l.chSessionClosed = make(chan net.Addr)
 	l.die = make(chan struct{})
